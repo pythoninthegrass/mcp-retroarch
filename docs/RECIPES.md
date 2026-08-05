@@ -8,10 +8,10 @@ Practical examples of driving RetroArch from Claude or any MCP client. Each reci
 
 ## 1. Identify what's loaded
 
-```
+```text
 retroarch_ping
 retroarch_get_status
-```
+```text
 
 Returns the RetroArch version and the loaded game's system, basename, and CRC32. CRC32 is the canonical fingerprint — useful for cross-referencing community cheat databases or speedrun tables.
 
@@ -21,12 +21,12 @@ Returns the RetroArch version and the loaded game's system, basename, and CRC32.
 
 > "I'm playing Pokémon Red. The badges count is currently 2. Walk into the gym, beat the leader, see badges count rise to 3, find the address."
 
-```
+```text
 1. retroarch_read_memory(address=0xC000, length=4096)   # snapshot A (badges=2)
 2. <user fights and wins, badges=3>
 3. retroarch_read_memory(address=0xC000, length=4096)   # snapshot B (badges=3)
 4. <Claude diffs A vs B for any byte/u16/u32 that changed 2 → 3>
-```
+```text
 
 Memory map varies wildly by core — check `retroarch_get_status` first to know the system, then look up its memory map online. Common landmarks:
 
@@ -47,9 +47,9 @@ If `retroarch_read_memory` returns "no memory map defined", the loaded core does
 
 > "The lives counter for this Mega Man game is at 0xC0FE. Set it to 99."
 
-```
+```text
 retroarch_write_memory(address=0xC0FE, bytes=[99])
-```
+```text
 
 Note: this **disables hardcore achievement mode** for the session — RetroArch won't let you cheat your way to achievements. If you want to keep hardcore on, save state first, write, do the test, then load state to restore.
 
@@ -57,9 +57,9 @@ Note: this **disables hardcore achievement mode** for the session — RetroArch 
 
 ## 4. Take a screenshot
 
-```
+```text
 retroarch_screenshot
-```
+```text
 
 RetroArch saves it to its configured screenshot directory. The NCI doesn't expose `screenshot_directory` via `GET_CONFIG_PARAM`, so check it via the GUI: Settings → Directory → Screenshot. (`savestate_directory`, `savefile_directory`, etc. ARE queryable via `retroarch_get_config`.)
 
@@ -69,12 +69,12 @@ RetroArch saves it to its configured screenshot directory. The NCI doesn't expos
 
 > "Pause the game, dump the current player position from RAM, then resume."
 
-```
+```text
 retroarch_pause_toggle                                        # pause
 retroarch_read_memory(address=0xD361, length=2)               # X coord
 retroarch_read_memory(address=0xD362, length=2)               # Y coord
 retroarch_pause_toggle                                        # resume
-```
+```text
 
 `PAUSE_TOGGLE` flips current state — there's no separate `PAUSE` and `UNPAUSE`. If you need to know the current state, call `retroarch_get_status` first.
 
@@ -84,7 +84,7 @@ retroarch_pause_toggle                                        # resume
 
 > "Pause, then advance 1 frame at a time and read RNG state to see how it changes per frame."
 
-```
+```text
 retroarch_pause_toggle
 for i in 1..10:
   rng_before = retroarch_read_memory(address=<rng_addr>, length=4)
@@ -92,7 +92,7 @@ for i in 1..10:
   rng_after  = retroarch_read_memory(address=<rng_addr>, length=4)
   print(f"frame {i}: {rng_before} → {rng_after}")
 retroarch_pause_toggle  # resume
-```
+```text
 
 `FRAMEADVANCE` only works when paused.
 
@@ -102,20 +102,20 @@ retroarch_pause_toggle  # resume
 
 > "Save current state, write some experimental values to RAM, see what happens, then restore."
 
-```
+```text
 retroarch_save_state_current
 # ... experiment freely ...
 retroarch_load_state_current
-```
+```text
 
 To target a specific slot:
 
-```
+```text
 # Walk slot pointer to slot 5
 retroarch_state_slot_minus  # repeat as needed to reach slot 0 first if unsure
 retroarch_state_slot_plus   # ×5
 retroarch_save_state_current
-```
+```text
 
 (NCI has no "current slot is N" query and no "save to slot N" command — only walk + save_current.)
 
@@ -125,9 +125,9 @@ retroarch_save_state_current
 
 > "Tell the user 'starting RAM dump in 3 seconds' before doing the work."
 
-```
+```text
 retroarch_show_message(message="starting RAM dump in 3 seconds")
-```
+```text
 
 Renders on the RetroArch overlay for a few seconds. Useful for narrating long-running scripted sessions, or for letting the user know an automation has reached a checkpoint.
 
@@ -135,10 +135,10 @@ Renders on the RetroArch overlay for a few seconds. Useful for narrating long-ru
 
 ## 9. Sanity-check the bridge before doing anything
 
-```
+```text
 retroarch_ping        # returns "OK — RetroArch <version>"
 retroarch_get_status  # confirms a game is loaded
-```
+```text
 
 If `ping` fails: RetroArch isn't running, Network Commands aren't enabled in `retroarch.cfg`, or the port doesn't match `RETROARCH_PORT`.
 
@@ -150,9 +150,9 @@ If `ping` fails: RetroArch isn't running, Network Commands aren't enabled in `re
 
 SwanStation doesn't define a system memory map (verified — see README's Tested cores table). Use `read_ram` instead, which goes through the CHEEVOS address space. PSX main RAM starts mapping around CHEEVOS offset `0x010000`:
 
-```
+```text
 retroarch_read_ram(address=0x010000, length=64)
-```
+```text
 
 You should see real game code (MIPS R3000 instructions) and data, not zeros. Lower addresses (`0x0000`–`0x010000`) are typically the PSX kernel area and read as zeros for most games.
 
@@ -170,7 +170,7 @@ README's *Game-pad input* section). Two receiver rules drive the shape of the
 script: input state **latches** until released, and RetroArch applies at most
 **one input datagram per emulated frame** per player.
 
-```
+```text
 1. retroarch_get_status                        # confirm 'playing' vs 'paused'
 2. retroarch_pause_toggle                      # pause (only if currently playing)
 3. retroarch_load_state_slot(slot=1)           # known anchor state — VERIFY, see below
@@ -185,7 +185,7 @@ script: input state **latches** until released, and RetroArch applies at most
 11. retroarch_input_release(buttons=["right"])
 12. retroarch_frame_advance                    # release applies
 13. retroarch_read_memory(address=..., length=...)   # observe the result
-```
+```text
 
 **Why the verify loop (steps 3-5):** state loading is an asynchronous task
 inside RetroArch. While paused, the load can apply *seconds* after the command
