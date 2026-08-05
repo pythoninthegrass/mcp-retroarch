@@ -1,0 +1,42 @@
+[project]
+name = "mcp-retroarch"
+version = "0.3.0"
+description = "MCP server for RetroArch — memory r/w, save state, screenshot, pause/frameadvance/reset via NCI, plus gamepad input via Network RetroPad (UDP)"
+requires-python = ">=3.13,<3.14"
+license = "MIT"
+authors = [{ name = "pythoninthegrass" }]
+readme = "README.md"
+keywords = ["mcp", "model-context-protocol", "retroarch", "libretro", "emulator", "claude"]
+classifiers = [
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "mcp>=1.12,<2",
+]
+
+[project.scripts]
+mcp-retroarch = "mcp_retroarch.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/pythoninthegrass/mcp-retroarch"
+Issues = "https://github.com/pythoninthegrass/mcp-retroarch/issues"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "ruff",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_retroarch"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
