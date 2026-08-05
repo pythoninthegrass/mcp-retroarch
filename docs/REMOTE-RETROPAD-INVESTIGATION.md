@@ -40,11 +40,13 @@ That two-instance shape isn't useful for `mcp-retroarch` — we want to drive *t
 The receiver side. RetroArch supports configuring one of its controller "ports" to take input from the network instead of from a physical/USB controller. This is what we'd want to talk to.
 
 **What we know:**
+
 - It exists.
 - UDP, port range 55400-55420 (one port per controller player; 55400 = Player 1).
 - Configured per-port in RetroArch settings.
 
 **What we don't know:**
+
 - Wire format. Is it a 16-bit RetroPad bitmask? A struct with analog axes? Length-prefixed? Plain text? **Not documented at the protocol level anywhere I could find.**
 - Whether it requires a handshake or is purely fire-and-forget.
 - How packet rate affects input — does each packet = one frame's input? Latched until next packet? Held for N ms?
@@ -93,6 +95,7 @@ For a v0.2.0 of `mcp-retroarch`, the "Network Retropad" path is the right one. F
 **Defer until BizHawk ships.** `mcp-bizhawk` already gives full game-pad input across 10+ systems via `joypad.set` (see `mcp-bizhawk/SCOPE.md`). That covers the "drive games via Claude" use case much more cleanly than back-doored UDP packets to a undocumented RetroArch input driver.
 
 Once BizHawk is live, revisit:
+
 - If users specifically want network input on a system BizHawk doesn't cover well → spend the source-dive on Network Retropad
 - If the demand is for "drive games on system X" generally → BizHawk probably already covers X
 
