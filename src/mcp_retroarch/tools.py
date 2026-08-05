@@ -1,0 +1,718 @@
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+
+import mcp.types as types
+from mcp.server.lowlevel import Server
+
+from mcp_retroarch.retroarch import RetroArchClient
+from mcp_retroarch.retropad import BUTTON_IDS, RetropadClient
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Tool descriptions are written to the TDQS rubric (Glama's Tool Definition
+# Quality Score). Each description covers, in order:
+#
+#   • PURPOSE — one clear action sentence.
+#   • USAGE — when to use this vs sibling tools (read_memory vs read_ram,
+#     pause_toggle vs frame_advance, save_state_current vs slot navigation, etc.).
+#   • BEHAVIOR — side effects, error conditions, destructive notes. Reads say
+#     "no side effects — pure read." State-mutating tools document the
+#     RetroArch NCI fire-and-forget UDP semantics: the protocol does NOT
+#     acknowledge most state changes, so writes / control commands return
+#     immediately and there is no way to verify they landed without a
+#     follow-up observation (read, get_status, screenshot, etc.).
+#   • RETURNS — exact shape of the success output.
+#
+# Each parameter has a `description` that adds context the schema can't
+# (units, examples, interactions, address-space caveats).
+# ──────────────────────────────────────────────────────────────────────────────
+
+NCI_TRANSPORT_NOTE = (
+    "Transport: RetroArch's Network Control Interface (NCI) over UDP "
+    "(default 127.0.0.1:55355, requires `network_cmd_enable = true` in retroarch.cfg)."
+)
+
+FIRE_AND_FORGET_NOTE = (
+    "FIRE-AND-FORGET: the NCI does NOT acknowledge this command — the call "
+    "returns as soon as the UDP datagram is sent, with no confirmation that "
+    "RetroArch received or applied it. To verify the effect, follow up with an "
+    "observable tool (retroarch_get_status for run state, retroarch_read_memory / "
+    "retroarch_read_ram for memory mutations, retroarch_screenshot for visual "
+    "state). UDP packets to a not-listening RetroArch are silently dropped."
+)
+
+MEMORY_API_NOTE = (
+    "RetroArch exposes TWO distinct memory APIs with different address spaces:\n"
+    "  • READ_CORE_MEMORY / WRITE_CORE_MEMORY (used by retroarch_read_memory / "
+    "retroarch_write_memory): goes through the libretro core's system memory map. "
+    "Preferred when the loaded core advertises a memory map (most modern cores do). "
+    "Errors with 'no memory map defined' if the loaded core doesn't.\n"
+    "  • READ_CORE_RAM / WRITE_CORE_RAM (used by retroarch_read_ram / retroarch_write_ram): "
+    "uses the achievement (CHEEVOS) address space. Works even when no core memory map is "
+    "defined, but addresses follow CHEEVOS conventions, not the system bus. Use as a "
+    "fallback when read_memory returns 'no memory map defined'.\n"
+    "Both APIs depend on the loaded core's exposed mapping — addresses you used on a "
+    "different core / system will NOT carry over."
+)
+
+RETROPAD_TRANSPORT_NOTE = (
+    "Transport: RetroArch's Network Gamepad receiver over UDP (default "
+    "127.0.0.1:55400 + player index; requires `network_remote_enable = true` "
+    "AND `network_remote_enable_user_p1 = true` (per player) in retroarch.cfg, "
+    "or Settings > Input > Network Gamepad). This is a SEPARATE channel from "
+    "the NCI command port — enabling Network Commands alone is not enough."
+)
+
+RETROPAD_SEMANTICS_NOTE = (
+    "Two receiver behaviors govern all input tools: "
+    "(1) LATCHING — a pressed button stays down until an explicit release; "
+    "there is no auto-release or keepalive. Always pair presses with releases "
+    "or use retroarch_input_release_all. "
+    "(2) ONE DATAGRAM PER FRAME — RetroArch consumes at most one queued input "
+    "message per emulated frame per player, so N changes sent back-to-back "
+    "land over N consecutive frames. For frame-accurate scripting: pause, then "
+    "alternate one input tool call with one retroarch_frame_advance per change."
+)
+
+BUTTON_NAME_LIST = ", ".join(BUTTON_IDS)
+
+TOOLS: list[types.Tool] = [
+    # ── Connectivity & introspection ────────────────────────────────────────
+
+    types.Tool(
+        name="retroarch_ping",
+        description=(
+            "PURPOSE: Verify connectivity to RetroArch's Network Control Interface and return the running RetroArch version string. "
+            "USAGE: Call once at start-of-session before issuing other tool calls — if it succeeds, the UDP transport is up and other tools should reach RetroArch. Use retroarch_get_status afterwards to confirm a game is loaded (ping succeeds even when RetroArch is sitting at the menu with no content). "
+            f"BEHAVIOR: No side effects — pure liveness probe. {NCI_TRANSPORT_NOTE} Times out after ~5 seconds with a clear error if RetroArch isn't running, has Network Commands disabled, is bound to a different host/port, or a firewall is blocking UDP 55355. "
+            "RETURNS: Single line 'OK — RetroArch VERSION', e.g. 'OK — RetroArch 1.20.0'."
+        ),
+        inputSchema={"type": "object", "properties": {}},
+    ),
+    types.Tool(
+        name="retroarch_get_status",
+        description=(
+            "PURPOSE: Report whether RetroArch is currently playing or paused, plus the loaded system, game basename, and CRC32. "
+            "USAGE: Call after retroarch_ping to learn what (if anything) is loaded; before retroarch_pause_toggle to decide whether the toggle will pause or unpause; before retroarch_frame_advance (which only steps when paused); whenever you need to confirm the previous fire-and-forget control command (pause/reset/load_state) actually took effect. For RetroArch settings (paths, flags) use retroarch_get_config instead — this tool only reports run-state and the loaded ROM identity. "
+            "BEHAVIOR: No side effects — pure read of emulator status via the NCI's GET_STATUS command. Returns 'No content loaded' (state=contentless) when RetroArch is sitting at the menu with no ROM. Returns an error on UDP timeout (RetroArch not reachable). "
+            "RETURNS: When content is loaded: four lines 'State: playing|paused', 'System: SYSTEM_ID', 'Game: BASENAME', 'CRC32: HEX or (none reported)'. When no content: literal 'No content loaded'."
+        ),
+        inputSchema={"type": "object", "properties": {}},
+    ),
+    types.Tool(
+        name="retroarch_get_config",
+        description=(
+            "PURPOSE: Read a single RetroArch configuration parameter by name via the NCI GET_CONFIG_PARAM command. "
+            "USAGE: Discover RetroArch's filesystem paths and selected settings without parsing retroarch.cfg yourself. For run-state (playing/paused, loaded ROM) use retroarch_get_status instead — this tool only reads static config. RetroArch whitelists which params are exposed; non-whitelisted names error even if they exist in retroarch.cfg. `screenshot_directory` is NOT exposed — see retroarch_screenshot. "
+            f"BEHAVIOR: No side effects — pure read. {NCI_TRANSPORT_NOTE} Errors if the param isn't in RetroArch's NCI whitelist, the value contains characters that break the line-based reply parser (rare — embedded newlines or null bytes), or the UDP query times out. "
+            "RETURNS: 'NAME = VALUE' where VALUE is the raw string as stored in retroarch.cfg (paths unquoted, booleans as 'true'/'false', integers as decimal)."
+        ),
+        inputSchema={
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": (
+                        "Config key — same snake_case ASCII identifier RetroArch uses in retroarch.cfg, case-sensitive, no surrounding quotes. "
+                        "Path-class keys (return absolute paths on disk): `savefile_directory`, `savestate_directory`, `system_directory`, `cache_directory`, `log_dir`, `runtime_log_directory`, `core_assets_directory`. "
+                        "User-data keys: `netplay_nickname`. "
+                        "Toggle keys (return 'true' / 'false'): `video_fullscreen`, `video_vsync`, `audio_mute_enable`. "
+                        "The full whitelist varies per RetroArch build; if a key returns an error rather than a value, it's not exposed via the NCI on this build. "
+                        "Notable exclusions: `screenshot_directory` is intentionally NOT exposed by RetroArch (see retroarch_screenshot for the workaround). Also no key for the currently-selected savestate slot — track that client-side via retroarch_state_slot_plus/minus."
+                    ),
+                },
+            },
+            "additionalProperties": False,
+        },
+    ),
+
+    # ── Memory reads ────────────────────────────────────────────────────────
+
+    types.Tool(
+        name="retroarch_read_memory",
+        description=(
+            "PURPOSE: Read up to 4096 bytes from emulated memory via the libretro core's system memory map (READ_CORE_MEMORY) and return them as a hex dump. "
+            "USAGE: Preferred memory-read tool when the loaded core advertises a memory map (most modern cores do). If it returns 'no memory map defined', fall back to retroarch_read_ram which uses the CHEEVOS address space. To poke a value back, pair with retroarch_write_memory at the same address. The classic two-snapshot RAM-hunt workflow uses this: snapshot before a known change, snapshot after, diff for matching deltas. Maximum 4096 bytes per call (NCI line-length limit); for larger reads, batch in 4 KiB chunks. "
+            f"BEHAVIOR: No side effects — pure read. {NCI_TRANSPORT_NOTE} Reads work whether emulation is paused or running. Returns an error if the loaded core doesn't expose a memory map ('no memory map defined'), the address is outside any core descriptor, length < 1, length > 4096, or the UDP query times out. RetroArch may return FEWER bytes than requested if the read crosses a memory-region boundary — the response reports the actual count.\n\n{MEMORY_API_NOTE}\n\n"
+            "RETURNS: Header line 'ADDR_HEX [N bytes]:' followed by space-separated 2-digit uppercase hex bytes."
+        ),
+        inputSchema={
+            "type": "object",
+            "required": ["address", "length"],
+            "properties": {
+                "address": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": (
+                        "Starting address in the libretro core's system memory map (NOT the CHEEVOS "
+                        "address space — that's read_ram). Address layout depends on the loaded core: "
+                        "e.g. SNES WRAM is typically at 0x7E0000-0x7FFFFF, GBA EWRAM at 0x02000000-0x0203FFFF, "
+                        "Genesis 68K RAM at 0xFF0000-0xFFFFFF. Reads `length` consecutive bytes starting here."
+                    ),
+                },
+                "length": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 4096,
+                    "description": (
+                        "Number of consecutive bytes to read (1-4096). Hard cap is RetroArch's NCI "
+                        "single-datagram size; chunk larger reads yourself. RetroArch may return fewer "
+                        "bytes if the read crosses a memory-region boundary in the core's descriptor list."
+                    ),
+                },
+            },
+            "additionalProperties": False,
+        },
+    ),
+    types.Tool(
+        name="retroarch_read_ram",
+        description=(
+            "PURPOSE: Read up to 4096 bytes from emulated memory via the achievement (CHEEVOS) address space (READ_CORE_RAM) and return them as a hex dump. "
+            "USAGE: Fallback memory-read tool — use when retroarch_read_memory returns 'no memory map defined' (older cores or those without an exposed system memory map can still respond to the older CHEEVOS read API). To poke back, pair with retroarch_write_ram at the same CHEEVOS address. Maximum 4096 bytes per call (NCI line-length limit). "
+            f"BEHAVIOR: No side effects — pure read. {NCI_TRANSPORT_NOTE} Reads work whether emulation is paused or running. Returns an error if the address is invalid for the CHEEVOS space, length < 1, length > 4096, or the UDP query times out. Like read_memory, RetroArch may return fewer bytes than requested at memory-region boundaries.\n\n{MEMORY_API_NOTE}\n\n"
+            "RETURNS: Header line 'ADDR_HEX [N bytes, CHEEVOS]:' followed by space-separated 2-digit uppercase hex bytes."
+        ),
+        inputSchema={
+            "type": "object",
+            "required": ["address", "length"],
+            "properties": {
+                "address": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": (
+                        "Starting address in the CHEEVOS (achievements) address space — distinct from "
+                        "the libretro system memory map used by retroarch_read_memory. CHEEVOS addresses "
+                        "follow per-system conventions used by RetroAchievements (e.g. SNES CHEEVOS "
+                        "addresses for WRAM start at 0x000000, not the SNES system bus 0x7E0000). "
+                        "If unsure, retroarch_read_memory is usually the right starting point."
+                    ),
+                },
+                "length": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 4096,
+                    "description": (
+                        "Number of consecutive bytes to read (1-4096). Hard cap is RetroArch's NCI "
+                        "single-datagram size. May return fewer bytes at region boundaries."
+                    ),
+                },
+            },
+            "additionalProperties": False,
+        },
+    ),
+
+    # ── Memory writes ───────────────────────────────────────────────────────
+
+    types.Tool(
+        name="retroarch_write_memory",
+        description=(
+            "PURPOSE: Write a byte sequence to emulated memory via the libretro core's system memory map (WRITE_CORE_MEMORY). "
+            "USAGE: Preferred memory-write tool when the loaded core advertises a memory map. Use for cheats, debug pokes, and game-state mutations (give a player N lives, unlock a flag, install a cheat table). If it returns 'no memory map defined', fall back to retroarch_write_ram. Maximum 4096 bytes per call (NCI line-length limit); for larger writes, batch in 4 KiB chunks. To establish a rollback point first, use retroarch_save_state_current. "
+            f"BEHAVIOR: DESTRUCTIVE: overwrites N bytes starting at `address` with no undo (snapshot via retroarch_save_state_current first if you need rollback). Disables RetroArch's hardcore mode for the rest of the session (RetroArch silently flips this flag when any memory-write NCI command is used). UNLIKE most NCI commands, this one DOES return a count — RetroArch replies with the number of bytes actually written, which may be less than requested if a read-only descriptor is hit mid-write (writes still apply up to that boundary). Direct memory write — bypasses MBC/mapper/DMA semantics. {NCI_TRANSPORT_NOTE} Returns an error if the loaded core doesn't expose a memory map, the address is invalid, the byte array is empty or > 4096, or the UDP query times out.\n\n{MEMORY_API_NOTE}\n\n"
+            "RETURNS: Single line 'Wrote N bytes → ADDR_HEX' where N is RetroArch's reported actual byte count."
+        ),
+        inputSchema={
+            "type": "object",
+            "required": ["address", "bytes"],
+            "properties": {
+                "address": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": (
+                        "Starting address in the libretro core's system memory map (NOT CHEEVOS space). "
+                        "Bytes are written sequentially address, address+1, ..., address+N-1."
+                    ),
+                },
+                "bytes": {
+                    "type": "array",
+                    "items": {"type": "integer", "minimum": 0, "maximum": 255},
+                    "minItems": 1,
+                    "maxItems": 4096,
+                    "description": (
+                        "Byte values to write, one per element (each 0-255). Length 1-4096 (hard cap "
+                        "from RetroArch's NCI single-datagram size). Written sequentially from `address`. "
+                        "If a read-only descriptor is encountered mid-array, the write stops at that "
+                        "boundary and the response reports how many bytes actually landed."
+                    ),
+                },
+            },
+            "additionalProperties": False,
+        },
+    ),
+    types.Tool(
+        name="retroarch_write_ram",
+        description=(
+            "PURPOSE: Write a byte sequence to emulated memory via the achievement (CHEEVOS) address space (WRITE_CORE_RAM). "
+            "USAGE: Fallback memory-write tool — use when retroarch_write_memory returns 'no memory map defined' or the core only supports the older CHEEVOS write API. Maximum 4096 bytes per call (NCI line-length limit). To verify the write landed (this command does NOT acknowledge — see BEHAVIOR), follow up with retroarch_read_ram at the same address. To establish a rollback point first, use retroarch_save_state_current. "
+            f"BEHAVIOR: DESTRUCTIVE: overwrites bytes starting at `address` with no undo (snapshot via retroarch_save_state_current first if you need rollback). Disables RetroArch's hardcore mode for the rest of the session. {FIRE_AND_FORGET_NOTE} This is the key behavioral difference vs retroarch_write_memory, which DOES return a count: write_ram has no way to report a partial write or a rejected address — the only way to verify is a follow-up retroarch_read_ram. Direct memory write — bypasses MBC/mapper/DMA semantics. {NCI_TRANSPORT_NOTE} Local input validation rejects empty arrays, > 4096 bytes, or values outside 0-255 before the UDP send.\n\n{MEMORY_API_NOTE}\n\n"
+            "RETURNS: Single line 'Wrote N bytes → ADDR_HEX (CHEEVOS, no ack)' where N is the array length you sent. The 'no ack' in the message is a reminder that RetroArch did not confirm the write."
+        ),
+        inputSchema={
+            "type": "object",
+            "required": ["address", "bytes"],
+            "properties": {
+                "address": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": (
+                        "Starting address in the CHEEVOS (achievements) address space — distinct from "
+                        "the libretro system memory map used by retroarch_write_memory. See retroarch_read_ram "
+                        "for address-space caveats. Bytes are written sequentially address, address+1, ..."
+                    ),
+                },
+                "bytes": {
+                    "type": "array",
+                    "items": {"type": "integer", "minimum": 0, "maximum": 255},
+                    "minItems": 1,
+                    "maxItems": 4096,
+                    "description": (
+                        "Byte values to write, one per element (each 0-255). Length 1-4096 (hard cap "
+                        "from RetroArch's NCI single-datagram size). Written sequentially from `address`. "
+                        "Because RetroArch does not acknowledge this command, partial / rejected writes "
+                        "cannot be distinguished from successful ones at the protocol level."
+                    ),
+                },
+            },
+            "additionalProperties": False,
+        },
+    ),
+
+    # ── Emulator control ───────────────────────────────────────────────────
+
+    types.Tool(
+        name="retroarch_pause_toggle",
+        description=(
+            "PURPOSE: Toggle RetroArch's pause state — pause if running, unpause if paused. "
+            "USAGE: RetroArch's NCI exposes ONLY a toggle, not separate pause/unpause commands. To reach a known state, call retroarch_get_status first to check `state: playing|paused`, then toggle if and only if you need to flip it. Use before a sequence of memory-inspect / write / screenshot calls when you need a stable game state across calls; pair with retroarch_frame_advance to step single frames without leaving pause. "
+            f"BEHAVIOR: Modifies emulator run state by flipping it. {FIRE_AND_FORGET_NOTE} Calling toggle when you don't know the current state will flip it to whichever state it ISN'T — confirm with retroarch_get_status before and after if it matters. {NCI_TRANSPORT_NOTE} "
+            "RETURNS: Single line 'Pause toggled' (this is a confirmation that the UDP datagram was sent, NOT that RetroArch received or acted on it)."
+        ),
+        inputSchema={"type": "object", "properties": {}},
+    ),
+    types.Tool(
+        name="retroarch_frame_advance",
+        description=(
+            "PURPOSE: Step emulation forward by exactly one frame. "
+            "USAGE: Use for frame-precise input automation, animation inspection, or letting the system initialize after a reset. ONLY effective while emulation is paused — RetroArch's FRAMEADVANCE is a no-op when running, so call retroarch_pause_toggle first (after checking retroarch_get_status to confirm you'll end up paused, not unpaused). For long jumps (thousands of frames) prefer retroarch_save_state_current / retroarch_load_state_current of a pre-prepared state — frame-by-frame stepping costs ~1 UDP round-trip per frame. "
+            f"BEHAVIOR: When paused, advances the emulator by exactly one frame and remains paused. When NOT paused, the command is silently ignored by RetroArch. {FIRE_AND_FORGET_NOTE} The new frame count is not reported — to verify progress, take screenshots before/after with retroarch_screenshot or read a known-changing memory value. {NCI_TRANSPORT_NOTE} "
+            "RETURNS: Single line 'Advanced one frame' (UDP-send confirmation only — does NOT confirm that RetroArch was paused or that the frame actually advanced)."
+        ),
+        inputSchema={"type": "object", "properties": {}},
+    ),
+    types.Tool(
+        name="retroarch_reset",
+        description=(
+            "PURPOSE: Soft-reset the running game — equivalent to pressing the console's reset button (NOT a power cycle). "
+            "USAGE: Use to start fresh from the game's reset vector. To return to a specific known-good point instead of boot, use retroarch_load_state_current or retroarch_load_state_slot with a previously saved state. Note this is a SOFT reset (button reset): RAM contents and any cart-internal state may persist depending on the system, unlike a true power cycle. "
+            f"BEHAVIOR: DESTRUCTIVE: triggers the loaded core's reset routine, which on most systems clears registers, resets the PC to the reset vector, and starts the boot sequence over. Unsaved game progress is lost. The loaded ROM stays loaded — only volatile state is affected. {FIRE_AND_FORGET_NOTE} To confirm the reset took, follow up with retroarch_get_status (state should still be 'playing') and/or a screenshot. {NCI_TRANSPORT_NOTE} "
+            "RETURNS: Single line 'Game reset' (UDP-send confirmation only — does NOT verify the reset executed)."
+        ),
+        inputSchema={"type": "object", "properties": {}},
+    ),
+    types.Tool(
+        name="retroarch_screenshot",
+        description=(
+            "PURPOSE: Capture a PNG screenshot of the current emulator display and save it to RetroArch's configured screenshot directory. "
+            "USAGE: Use to capture visible game state for inspection, sequence documentation, or to verify that a fire-and-forget control command (pause / reset / load_state / write) had a visible effect. To capture a specific game state, pause / advance frames / load state first to get the frame you want, then call this. IMPORTANT: unlike most screenshot tools, this one DOES NOT take a path argument — RetroArch saves to its own configured `screenshot_directory`, which the NCI does not expose (it is NOT readable via retroarch_get_config). To find the file, check RetroArch's settings UI (Settings → Directory → Screenshots) or look at where screenshots normally land for your install. "
+            f"BEHAVIOR: Writes a new timestamped PNG to RetroArch's screenshot directory — no existing files are overwritten (RetroArch generates a fresh filename per shot). {FIRE_AND_FORGET_NOTE} The returned message confirms only that the SCREENSHOT command was sent, not that the file was actually written (disk full, permission denied, etc. would fail silently from the tool's perspective). {NCI_TRANSPORT_NOTE} "
+            "RETURNS: Single line 'Screenshot saved to RetroArch's configured screenshot directory' (UDP-send confirmation only)."
+        ),
+        inputSchema={"type": "object", "properties": {}},
+    ),
+    types.Tool(
+        name="retroarch_show_message",
+        description=(
+            "PURPOSE: Display a single-line notification message overlaid on the RetroArch window (OSD). "
+            "USAGE: For in-emulator debug output, progress markers during long scripts, or text to a human watching the RetroArch window. Purely cosmetic — no effect on game state. The ONLY way to push agent-generated text onto the RetroArch display; there is no read-the-screen counterpart. "
+            f"BEHAVIOR: Renders the message in RetroArch's notification area for ~3 seconds (RetroArch's default notification timeout, configurable via the input_overlay_show_inputs_port setting family). Messages are NOT queued — rapid calls replace the previous message before users can read it. {FIRE_AND_FORGET_NOTE} {NCI_TRANSPORT_NOTE} "
+            "RETURNS: 'Showed: MESSAGE' echoing what was sent (UDP-send confirmation only — does NOT verify the overlay rendered)."
+        ),
+        inputSchema={
+            "type": "object",
+            "required": ["message"],
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": (
+                        "UTF-8 message text. Spaces and most punctuation are preserved verbatim. "
+                        r"NEWLINES (\n / \r) TRUNCATE the message — the NCI protocol is line-terminated, so anything after the first newline is silently dropped on the wire. "
+                        "Keep messages to ONE LINE; recommended ≤80 chars to fit RetroArch's notification overlay without horizontal clipping (the exact width depends on the user's video resolution and font size). "
+                        "Consecutive calls REPLACE rather than queue, so use one message per logical event rather than emitting a stream of status updates. "
+                        "Special characters: percent-signs are safe (RetroArch does NOT printf-interpret the string), quotes are safe (no shell interpolation), but ASCII control bytes other than space are likely rendered as boxes or stripped."
+                    ),
+                },
+            },
+            "additionalProperties": False,
+        },
+    ),
+
+    # ── Save state ─────────────────────────────────────────────────────────
+
+    types.Tool(
+        name="retroarch_save_state_current",
+        description=(
+            "PURPOSE: Save the entire emulator state to RetroArch's currently-selected save slot (one of slots 0-9). "
+            "USAGE: Use as a rollback point before risky writes, to bookmark interesting game states, or to share repro states. RetroArch's NCI has NO 'save to slot N' command — to target a specific slot, you must first walk the slot pointer there with retroarch_state_slot_plus / retroarch_state_slot_minus, then call this. The current slot is RetroArch's internal state and is NOT reported back by the NCI, so if you don't track it yourself, observe the on-screen slot indicator after each plus/minus or use retroarch_show_message as a confirmation echo. The companion retroarch_load_state_current restores from the same slot. For path-based savestate I/O (no slots), there is no NCI equivalent — use the BizHawk or mGBA MCP servers instead. "
+            f"BEHAVIOR: DESTRUCTIVE TO TARGET SLOT FILE: overwrites whatever was previously in the currently-selected slot with no prompt or backup. The state file lands in RetroArch's configured `savestate_directory` (queryable via retroarch_get_config). State files are bound to the EXACT ROM and core version that produced them — loading on a different ROM or core typically fails. {FIRE_AND_FORGET_NOTE} To verify the save happened, retroarch_load_state_current it back and observe via memory-read or screenshot. {NCI_TRANSPORT_NOTE} "
+            "RETURNS: Single line 'Saved to current slot' (UDP-send confirmation only — does NOT verify the file was written, nor report which slot number it landed in)."
+        ),
+        inputSchema={"type": "object", "properties": {}},
+    ),
+    types.Tool(
+        name="retroarch_load_state_current",
+        description=(
+            "PURPOSE: Restore the emulator from RetroArch's currently-selected save slot (one of slots 0-9). "
+            "USAGE: Counterpart to retroarch_save_state_current. Use to undo a sequence of writes/inputs (the snapshot/experiment/restore workflow) or to start each tool-call sequence from a known baseline. Loads from whichever slot is currently selected (the same slot save_state_current would target). To load from a specific slot WITHOUT changing the current-slot pointer, use retroarch_load_state_slot instead — that's important if you're alternating between bookmarks. To start fresh from boot, use retroarch_reset. "
+            f"BEHAVIOR: DESTRUCTIVE TO LIVE STATE: replaces ALL current emulator state (RAM, registers, mapper, audio, framecount) with the slot file's contents. Anything not previously snapshotted is lost. The state file MUST come from the same ROM and same core version that produced it — loading mismatched files typically fails or destabilizes the core. {FIRE_AND_FORGET_NOTE} If the currently-selected slot has no saved state, RetroArch silently ignores the command — no error is raised. To verify the load happened, follow up with a memory-read or screenshot. {NCI_TRANSPORT_NOTE} "
+            "RETURNS: Single line 'Loaded from current slot' (UDP-send confirmation only — does NOT verify the slot existed or the load succeeded)."
+        ),
+        inputSchema={"type": "object", "properties": {}},
+    ),
+    types.Tool(
+        name="retroarch_load_state_slot",
+        description=(
+            "PURPOSE: Load state from an explicitly-named save slot number, without modifying RetroArch's currently-selected slot pointer. "
+            "USAGE: Use to load from a specific slot when you don't want to disturb the current-slot pointer (e.g. you're alternating between two bookmarks while keeping the 'live' slot for ongoing saves). For loading from the currently-selected slot, use retroarch_load_state_current — semantically distinct: this tool ignores the current-slot pointer entirely and addresses by number. Slots are numbered 0-9 by RetroArch convention. There is no `retroarch_save_state_slot` counterpart in the NCI — saving to a specific slot still requires walking the pointer with state_slot_plus/minus and then calling save_state_current. "
+            f"BEHAVIOR: DESTRUCTIVE TO LIVE STATE: replaces ALL current emulator state with the named slot's contents. Anything not previously snapshotted is lost. The state file MUST come from the same ROM and core version that produced it. {NCI_TRANSPORT_NOTE} UNLIKE most NCI control commands, LOAD_STATE_SLOT does send a reply (this client awaits it), so a UDP timeout will surface as an error here even though sibling load/save calls are fire-and-forget. If the named slot has no saved state, RetroArch's reply still indicates the command was processed — verify with a memory-read or screenshot. The current-slot pointer is unchanged after this call. "
+            "RETURNS: Single line 'Loaded from slot N' echoing the requested slot number."
+        ),
+        inputSchema={
+            "type": "object",
+            "required": ["slot"],
+            "properties": {
+                "slot": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": (
+                        "Save state slot number to load from. RetroArch's standard slot range is 0-9 "
+                        "(ten slots), but the NCI does not enforce a hard upper bound — slot numbers "
+                        "outside the configured range will simply find no file and silently no-op. "
+                        "This call does NOT change the currently-selected slot pointer (use "
+                        "retroarch_state_slot_plus / retroarch_state_slot_minus for that)."
+                    ),
+                },
+            },
+            "additionalProperties": False,
+        },
+    ),
+    types.Tool(
+        name="retroarch_state_slot_plus",
+        description=(
+            "PURPOSE: Increment RetroArch's currently-selected save slot pointer by 1 (e.g. slot 3 → slot 4). "
+            "USAGE: Combine with retroarch_save_state_current or retroarch_load_state_current to target a specific slot — these tools always operate on the current slot, so to save TO slot 5 you must walk the pointer there first. Pair with retroarch_state_slot_minus to walk backwards. RetroArch's NCI exposes NO way to set the slot directly to N or to query the current slot number, so if you don't track it yourself you must walk from a known position (e.g. slot 0) or observe the on-screen indicator. For loading a specific slot WITHOUT changing the pointer, use retroarch_load_state_slot instead. "
+            f"BEHAVIOR: Mutates RetroArch's internal current-slot pointer (+1). Wraps or clamps per RetroArch's slot-cycling configuration (typically wraps at 9 → 0). {FIRE_AND_FORGET_NOTE} The new slot number is NOT reported back — track it client-side or watch the on-screen slot indicator. No effect on emulator memory / run state — only the slot pointer used by future save_state_current / load_state_current calls changes. {NCI_TRANSPORT_NOTE} "
+            "RETURNS: Single line 'Incremented current slot' (UDP-send confirmation only — does NOT report the new slot number)."
+        ),
+        inputSchema={"type": "object", "properties": {}},
+    ),
+    types.Tool(
+        name="retroarch_state_slot_minus",
+        description=(
+            "PURPOSE: Decrement RetroArch's currently-selected save slot pointer by 1 (e.g. slot 3 → slot 2). "
+            "USAGE: Counterpart to retroarch_state_slot_plus. Combine with retroarch_save_state_current or retroarch_load_state_current to target a lower-numbered slot — these tools always operate on the current slot. RetroArch's NCI exposes NO way to set the slot directly to N or to query the current slot number, so track it client-side or walk from a known position. For loading a specific slot WITHOUT changing the pointer, use retroarch_load_state_slot. "
+            f"BEHAVIOR: Mutates RetroArch's internal current-slot pointer (-1). Wraps or clamps per RetroArch's slot-cycling configuration (typically wraps at 0 → 9). {FIRE_AND_FORGET_NOTE} The new slot number is NOT reported back — track it client-side or watch the on-screen slot indicator. No effect on emulator memory / run state — only the slot pointer used by future save_state_current / load_state_current calls changes. {NCI_TRANSPORT_NOTE} "
+            "RETURNS: Single line 'Decremented current slot' (UDP-send confirmation only — does NOT report the new slot number)."
+        ),
+        inputSchema={"type": "object", "properties": {}},
+    ),
+
+    # ── Game-pad input (Network RetroPad) ──────────────────────────────────
+
+    types.Tool(
+        name="retroarch_input_press",
+        description=(
+            "PURPOSE: Press (latch down) one or more RetroPad buttons for a player via RetroArch's Network Gamepad channel. "
+            "USAGE: The low-level press primitive. For a simple press-and-release use retroarch_input_tap instead. For frame-accurate scripting: pause first, call this for ONE button, then retroarch_frame_advance, repeating per change (see BEHAVIOR for why). Buttons follow libretro RetroPad naming — on PlayStation cores: b=Cross, a=Circle, y=Square, x=Triangle. "
+            f"BEHAVIOR: {RETROPAD_SEMANTICS_NOTE} {FIRE_AND_FORGET_NOTE.replace('NCI does NOT', 'Network Gamepad channel does NOT')} {RETROPAD_TRANSPORT_NOTE} "
+            "RETURNS: 'Pressed BUTTONS (player N)' — UDP-send confirmation only; verify effect via memory read or screenshot."
+        ),
+        inputSchema={
+            "type": "object",
+            "required": ["buttons"],
+            "properties": {
+                "buttons": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "description": (
+                        f"RetroPad button names (case-insensitive): {BUTTON_NAME_LIST}. "
+                        "One datagram is sent per button; RetroArch applies one per emulated frame, "
+                        "so multiple buttons land on consecutive frames (all remain latched once applied)."
+                    ),
+                },
+                "player": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 20,
+                    "description": (
+                        "Player index, 0-based. Player N's receiver listens at base port + N "
+                        "(default 55400 + N) and must be individually enabled in RetroArch "
+                        "(network_remote_enable_user_p<N+1>). Default 0 (Player 1)."
+                    ),
+                },
+            },
+            "additionalProperties": False,
+        },
+    ),
+    types.Tool(
+        name="retroarch_input_release",
+        description=(
+            "PURPOSE: Release (latch up) one or more previously pressed RetroPad buttons for a player. "
+            "USAGE: Counterpart to retroarch_input_press — every press must eventually be paired with a release (or retroarch_input_release_all), because the receiver latches state indefinitely. Releasing a button that is not pressed is harmless. "
+            f"BEHAVIOR: {RETROPAD_SEMANTICS_NOTE} {RETROPAD_TRANSPORT_NOTE} Fire-and-forget UDP — no acknowledgement. "
+            "RETURNS: 'Released BUTTONS (player N)' — UDP-send confirmation only."
+        ),
+        inputSchema={
+            "type": "object",
+            "required": ["buttons"],
+            "properties": {
+                "buttons": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "description": f"RetroPad button names (case-insensitive): {BUTTON_NAME_LIST}.",
+                },
+                "player": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 20,
+                    "description": "Player index, 0-based (see retroarch_input_press). Default 0.",
+                },
+            },
+            "additionalProperties": False,
+        },
+    ),
+    types.Tool(
+        name="retroarch_input_release_all",
+        description=(
+            "PURPOSE: Zero every button and both analog sticks for a player in a single packet — the input panic button. "
+            "USAGE: Use at the start and end of every scripted input session so no latched button leaks into or out of your script; also as recovery when you have lost track of which buttons are down. Unlike releasing 16 buttons individually (16 datagrams = 16 frames to drain), this clears everything in ONE datagram, applied on the next frame. "
+            "BEHAVIOR: Implementation detail worth knowing: RetroArch's receiver zeroes all input state for a player whenever it reads a datagram whose size is not exactly sizeof(struct remote_message) — this tool sends a deliberately undersized datagram to trigger exactly that. Documented receiver behavior in input/input_driver.c, stable across RetroArch releases, but it is technically a protocol edge case rather than a designed command. "
+            f"{RETROPAD_TRANSPORT_NOTE} Fire-and-forget UDP — no acknowledgement. "
+            "RETURNS: 'Released all input (player N)' — UDP-send confirmation only."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "player": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 20,
+                    "description": "Player index, 0-based (see retroarch_input_press). Default 0.",
+                },
+            },
+            "additionalProperties": False,
+        },
+    ),
+    types.Tool(
+        name="retroarch_input_set_analog",
+        description=(
+            "PURPOSE: Set one analog stick's X/Y position for a player (values persist until changed). "
+            "USAGE: For analog movement, camera control, or pressure-sensitive navigation on cores that read analog sticks. Values are int16: -32768 (full left/up) to 32767 (full right/down), 0,0 = centered. Like buttons, analog state LATCHES — recenter with (0, 0) or retroarch_input_release_all when done. Sends two datagrams (X then Y), which the receiver applies over two consecutive frames. "
+            f"BEHAVIOR: {RETROPAD_SEMANTICS_NOTE} {RETROPAD_TRANSPORT_NOTE} Fire-and-forget UDP — no acknowledgement. "
+            "RETURNS: 'Analog STICK set to (X, Y) (player N)' — UDP-send confirmation only."
+        ),
+        inputSchema={
+            "type": "object",
+            "required": ["stick", "x", "y"],
+            "properties": {
+                "stick": {
+                    "type": "string",
+                    "enum": ["left", "right"],
+                    "description": "Which analog stick to set.",
+                },
+                "x": {
+                    "type": "integer",
+                    "minimum": -32768,
+                    "maximum": 32767,
+                    "description": "Horizontal axis: -32768 = full left, 0 = centered, 32767 = full right.",
+                },
+                "y": {
+                    "type": "integer",
+                    "minimum": -32768,
+                    "maximum": 32767,
+                    "description": "Vertical axis: -32768 = full up, 0 = centered, 32767 = full down.",
+                },
+                "player": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 20,
+                    "description": "Player index, 0-based (see retroarch_input_press). Default 0.",
+                },
+            },
+            "additionalProperties": False,
+        },
+    ),
+    types.Tool(
+        name="retroarch_input_tap",
+        description=(
+            "PURPOSE: Press buttons, hold them for a duration, then release them — the everyday building block for menu navigation and normal play. "
+            "USAGE: Use while emulation is RUNNING (state 'playing' per retroarch_get_status). The default 100 ms hold spans ~6 frames at 60 fps, comfortably above the one-datagram-per-frame application delay and typical game input-polling windows. For frame-accurate work while PAUSED, do not use this tool — compose retroarch_input_press / retroarch_frame_advance / retroarch_input_release manually, because this tool's hold is wall-clock and a paused emulator never samples it. "
+            f"BEHAVIOR: Sends press datagrams, waits hold_ms of wall-clock time, sends release datagrams. Multiple buttons latch over consecutive frames (see below), so a two-button chord is fully held only from the second frame of the hold window onward. {RETROPAD_SEMANTICS_NOTE} {RETROPAD_TRANSPORT_NOTE} "
+            "RETURNS: 'Tapped BUTTONS for HOLDms (player N)' after the release datagrams are sent."
+        ),
+        inputSchema={
+            "type": "object",
+            "required": ["buttons"],
+            "properties": {
+                "buttons": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "description": f"RetroPad button names (case-insensitive): {BUTTON_NAME_LIST}.",
+                },
+                "hold_ms": {
+                    "type": "integer",
+                    "minimum": 16,
+                    "maximum": 5000,
+                    "description": (
+                        "Wall-clock hold duration in milliseconds. Default 100 (~6 frames at 60 fps). "
+                        "Minimum 16 (~1 frame); values under ~50 ms risk the game's input poll missing "
+                        "the press entirely on cores that debounce."
+                    ),
+                },
+                "player": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 20,
+                    "description": "Player index, 0-based (see retroarch_input_press). Default 0.",
+                },
+            },
+            "additionalProperties": False,
+        },
+    ),
+]
+
+
+def _addr_hex(n: int) -> str:
+    return f"0x{n:04X}"
+
+
+def _ok(text: str) -> list[types.TextContent]:
+    return [types.TextContent(type="text", text=text)]
+
+
+def register_tools(server: Server, ra: RetroArchClient, pad: RetropadClient) -> None:
+    @server.list_tools()
+    async def list_tools() -> list[types.Tool]:
+        return TOOLS
+
+    @server.call_tool()
+    async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.ContentBlock]:
+        p = arguments
+
+        match name:
+            case "retroarch_ping":
+                v = await ra.get_version()
+                return _ok(f"OK — RetroArch {v}")
+
+            case "retroarch_get_status":
+                s = await ra.get_status()
+                if s.state == "contentless":
+                    return _ok("No content loaded")
+                return _ok(
+                    f"State:  {s.state}\n"
+                    f"System: {s.system}\n"
+                    f"Game:   {s.game}\n"
+                    f"CRC32:  {s.crc32 or '(none reported)'}"
+                )
+
+            case "retroarch_get_config":
+                v = await ra.get_config_param(p["name"])
+                return _ok(f"{p['name']} = {v}")
+
+            case "retroarch_read_memory":
+                data = await ra.read_memory(p["address"], p["length"])
+                hex_str = " ".join(f"{b:02X}" for b in data)
+                return _ok(f"{_addr_hex(p['address'])} [{len(data)} bytes]:\n{hex_str}")
+
+            case "retroarch_read_ram":
+                data = await ra.read_ram(p["address"], p["length"])
+                hex_str = " ".join(f"{b:02X}" for b in data)
+                return _ok(f"{_addr_hex(p['address'])} [{len(data)} bytes, CHEEVOS]:\n{hex_str}")
+
+            case "retroarch_write_memory":
+                n = await ra.write_memory(p["address"], p["bytes"])
+                return _ok(f"Wrote {n} bytes → {_addr_hex(p['address'])}")
+
+            case "retroarch_write_ram":
+                await ra.write_ram(p["address"], p["bytes"])
+                return _ok(f"Wrote {len(p['bytes'])} bytes → {_addr_hex(p['address'])} (CHEEVOS, no ack)")
+
+            case "retroarch_pause_toggle":
+                await ra.pause_toggle()
+                return _ok("Pause toggled")
+
+            case "retroarch_frame_advance":
+                await ra.frame_advance()
+                return _ok("Advanced one frame")
+
+            case "retroarch_reset":
+                await ra.reset()
+                return _ok("Game reset")
+
+            case "retroarch_screenshot":
+                await ra.screenshot()
+                return _ok("Screenshot saved to RetroArch's configured screenshot directory")
+
+            case "retroarch_show_message":
+                await ra.show_message(p["message"])
+                return _ok(f"Showed: {p['message']}")
+
+            case "retroarch_save_state_current":
+                await ra.save_state_current()
+                return _ok("Saved to current slot")
+
+            case "retroarch_load_state_current":
+                await ra.load_state_current()
+                return _ok("Loaded from current slot")
+
+            case "retroarch_load_state_slot":
+                await ra.load_state_slot(p["slot"])
+                return _ok(f"Loaded from slot {p['slot']}")
+
+            case "retroarch_state_slot_plus":
+                await ra.state_slot_plus()
+                return _ok("Incremented current slot")
+
+            case "retroarch_state_slot_minus":
+                await ra.state_slot_minus()
+                return _ok("Decremented current slot")
+
+            case "retroarch_input_press":
+                player = int(p.get("player", 0))
+                buttons: list[str] = p["buttons"]
+                await pad.press_buttons(buttons, player)
+                return _ok(f"Pressed {'+'.join(buttons)} (player {player})")
+
+            case "retroarch_input_release":
+                player = int(p.get("player", 0))
+                buttons = p["buttons"]
+                await pad.release_buttons(buttons, player)
+                return _ok(f"Released {'+'.join(buttons)} (player {player})")
+
+            case "retroarch_input_release_all":
+                player = int(p.get("player", 0))
+                await pad.release_all(player)
+                return _ok(f"Released all input (player {player})")
+
+            case "retroarch_input_set_analog":
+                player = int(p.get("player", 0))
+                await pad.set_analog(p["stick"], p["x"], p["y"], player)
+                return _ok(f"Analog {p['stick']} set to ({p['x']}, {p['y']}) (player {player})")
+
+            case "retroarch_input_tap":
+                player = int(p.get("player", 0))
+                hold_ms = int(p.get("hold_ms", 100))
+                buttons = p["buttons"]
+                await pad.press_buttons(buttons, player)
+                await asyncio.sleep(hold_ms / 1000)
+                await pad.release_buttons(buttons, player)
+                return _ok(f"Tapped {'+'.join(buttons)} for {hold_ms}ms (player {player})")
+
+            case _:
+                raise ValueError(f"Unknown tool: {name}")
