@@ -1,0 +1,60 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(fd:*)",
+      "Bash(git add:*)",
+      "Bash(git bisect:*)",
+      "Bash(git checkout:*)",
+      "Bash(git commit:*)",
+      "Bash(git log:*)",
+      "Bash(git push:*)",
+      "Bash(git rev-parse:*)",
+      "Bash(git revert:*)",
+      "Bash(git show:*)",
+      "Bash(git switch:*)",
+      "Bash(head:*)",
+      "Bash(ln:*)",
+      "Bash(ls:*)",
+      "Bash(lsof:*)",
+      "Bash(neon:*)",
+      "Bash(prek:*)",
+      "Bash(pytest:*)",
+      "Bash(python*:*)",
+      "Bash(rg:*)",
+      "Bash(ruff:*)",
+      "Bash(sqlite3:*)",
+      "Bash(task:*)",
+      "Bash(tee:*)",
+      "Bash(timeout:*)",
+      "Bash(tree:*)",
+      "Bash(uv:*)",
+      "mcp__context7__query-docs",
+      "mcp__serena__activate_project",
+      "mcp__serena__find_file",
+      "mcp__serena__find_referencing_symbols",
+      "mcp__serena__get_current_config",
+      "mcp__serena__initial_instructions",
+      "mcp__serena__list_dir",
+      "mcp__serena__read_memory",
+      "mcp__serena__think_about_task_adherence",
+      "Read(//tmp/**)",
+      "Read(//Users/*/Desktop/**)",
+      "Read(//Users/*/Downloads/**)",
+      "WebSearch"
+    ],
+    "deny": [ ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "git diff --name-only HEAD | xargs -r prek run --files"
+          }
+        ]
+      }
+    ]
+  }
+}

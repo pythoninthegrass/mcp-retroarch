@@ -1,0 +1,16 @@
+# Exclude IDE and tooling directories
+.vscode/
+.agents/
+.claude/
+
+# Exclude dependencies and build artifacts
+node_modules/
+app/frontend/node_modules/
+app/frontend/dist/
+src-tauri/target/
+
+# Exclude lock files
+*.lock
+Cargo.lock
+package-lock.json
+deno.lock

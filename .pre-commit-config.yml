@@ -1,0 +1,85 @@
+fail_fast: true
+
+repos:
+  - repo: local
+    hooks:
+      - id: deno-fmt
+        name: deno fmt
+        entry: deno fmt
+        language: system
+        files: \.(ts|tsx|js|jsx|json|jsonc)$
+        exclude: |
+            (?x)^(
+                \.vscode/|
+                \.agents/|
+                \.claude/|
+                vendor/
+            )
+      - id: deno-lint
+        name: deno lint
+        entry: deno lint
+        language: system
+        files: \.(ts|tsx|js|jsx)$
+        exclude: |
+            (?x)^(
+                \.vscode/|
+                \.agents/|
+                \.claude/|
+                vendor/
+            )
+  - repo: https://github.com/thibaudcolas/pre-commit-stylelint
+    rev: v17.14.1
+    hooks:
+      - id: stylelint
+        args: [--fix]
+        files: \.(css|scss|sass|less|html|js|jsx|ts|tsx)$
+        exclude: |
+            (?x)^(
+                \.vscode/|
+                \.agents/|
+                \.claude/
+            )
+  - repo: https://github.com/igorshubovych/markdownlint-cli
+    rev: v0.49.1
+    hooks:
+      - id: markdownlint
+        args: [--fix, --config, .markdownlint.jsonc]
+        exclude: |
+            (?x)^(
+                docs/linear_task_analysis\.md|
+                docs/backlog_task_analysis\.md|
+                backlog/docs/
+            )
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-added-large-files
+        args: ['--maxkb=1024']
+      - id: check-executables-have-shebangs
+        files: \.(sh)$
+      - id: check-merge-conflict
+      - id: check-shebang-scripts-are-executable
+        files: \.(sh)$
+      - id: check-symlinks
+      - id: destroyed-symlinks
+      - id: detect-private-key
+      - id: end-of-file-fixer
+        files: \.(sh|js|ts|css|html)$
+      - id: fix-byte-order-marker
+      - id: mixed-line-ending
+        files: \.(sh|js|ts|css|html)$
+      - id: check-toml
+        files: \.toml$
+      - id: check-yaml
+        args: [--unsafe]
+        files: \.(yaml|yml)$
+      - id: pretty-format-json
+        args: ['--autofix', '--indent=2', '--no-sort-keys']
+        files: \.(json|jsonc)$
+        exclude: |
+            (?x)^(
+                .devcontainer/devcontainer.json|
+                .vscode/launch.json|
+                .vscode/settings.json|
+                .vscode/extensions.json|
+            )$
